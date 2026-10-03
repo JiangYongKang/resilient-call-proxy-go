@@ -60,6 +60,17 @@ type Breaker struct {
 	probesUsed  int
 	probesLive  int
 	transitions []Transition
+
+	// 目标侧结论计数（仅在凭证携裁决归还时累计）。
+	successes      int64
+	rejects        int64
+	slowFailures   int64
+	dispatched     int64
+	breakerRejects int64
+
+	// 非目标责任终止计数（取消/预算耗尽）：不进失败、不推动熔断。
+	callerCanceled  int64
+	budgetExhausted int64
 }
 
 func NewBreaker(t Target, cfg BreakerConfig, clock Clock) *Breaker {
@@ -84,12 +95,29 @@ type Permit struct {
 func (p *Permit) IsProbe() bool { return p != nil && p.probe }
 
 // Release 归还名额并按调用结果驱动状态迁移。
+// 仅用于“下游确实给出了目标侧裁决”的调用（成功/明确拒绝/慢故障）。
 func (p *Permit) Release(result AttemptResult) {
 	if p == nil || p.used {
 		return
 	}
 	p.used = true
 	p.br.record(p.probe, result)
+}
+
+// ReleaseAborted 用于“非目标责任终止”：发起方取消或共享预算耗尽。
+//   - 绝不推动熔断状态：半开探测因此被取消时不会重新 OPEN；
+//   - 探测名额按“归还”处理，使后续探测仍可被放行（名额不泄漏、不被消耗）；
+//   - 仅做中性统计（与失败计数分离）。
+//
+// dispatched 表示下游调用是否真的已经发出：放行后、发起调用前就被终止
+// 时传 false，这次不算目标被调用过，也不计入 dispatched。
+// reason 只能是 ReasonCallerCanceled / ReasonBudgetExhausted。
+func (p *Permit) ReleaseAborted(dispatched bool, reason Reason) {
+	if p == nil || p.used {
+		return
+	}
+	p.used = true
+	p.br.recordAbort(p.probe, dispatched, reason)
 }
 
 // State 返回当前状态；惰性评估冷却到期（OPEN -> HALF_OPEN）。
@@ -116,8 +144,10 @@ func (b *Breaker) Allow() (*Permit, bool) {
 			b.probesLive++
 			return &Permit{br: b, probe: true}, true
 		}
+		b.breakerRejects++
 		return nil, false
 	default: // OPEN
+		b.breakerRejects++
 		return nil, false
 	}
 }
@@ -143,12 +173,25 @@ func (b *Breaker) evaluateLocked() {
 	}
 }
 
-// record 根据一次已放行调用的结果更新状态。
+// record 根据一次已放行、且下游确实给出了目标侧裁决的调用更新状态与计数。
+// 取消 / 预算耗尽不走这里（见 recordAbort），因此这里的任何非成功结果都
+// 是真正的目标侧失败，可以安全地推动熔断。
 func (b *Breaker) record(probe bool, result AttemptResult) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	ok := result == AttemptOK
+	b.dispatched++
+	switch result {
+	case AttemptOK:
+		b.successes++
+	case AttemptReject:
+		b.rejects++
+	default:
+		// AttemptSlowFail / AttemptTimeout（后者仅在预算仍存活时才会走到
+		// 这里，即目标自己的尝试时限先到，语义等同慢故障/抖动）。
+		b.slowFailures++
+	}
 
 	if probe {
 		// 探测名额归还：无论成功失败，占用名额都要释放。
@@ -189,6 +232,65 @@ func (b *Breaker) record(probe bool, result AttemptResult) {
 			b.openedAt = b.clock.Now()
 		}
 	}
+}
+
+// recordAbort 处理一次“非目标责任终止”的归还（取消/预算耗尽）。
+// 与 record 的本质区别：
+//   - 不累计任何目标侧失败计数、不推动熔断状态；
+//   - 半开探测因此终止时不重新 OPEN，且探测名额完整归还
+//     （probesUsed/probesLive 都回退），后续探测仍可被放行；
+//   - 只在中性分类里单独计数。
+func (b *Breaker) recordAbort(probe, dispatched bool, reason Reason) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if dispatched {
+		b.dispatched++
+	}
+	switch reason {
+	case ReasonCallerCanceled:
+		b.callerCanceled++
+	case ReasonBudgetExhausted:
+		b.budgetExhausted++
+	}
+
+	if !probe {
+		return
+	}
+	// 探测名额归还：在途中名额先释放。
+	if b.probesLive > 0 {
+		b.probesLive--
+	}
+	// 仅当仍停留在 HALF_OPEN（尚未被其他探测的成败改变状态）时，把本次
+	// 探测名额退还为可用：取消/超时不能“消耗”探测名额，也不能重开熔断。
+	if b.state == BreakerHalfOpen && b.probesUsed > 0 {
+		b.probesUsed--
+	}
+}
+
+// fillHealthLocked 在调用方已持有 b.mu 时填充该目标的健康字段。
+// 会先惰性评估冷却到期，保证 State 与计数在同一把锁的同一临界区读出。
+func (b *Breaker) fillHealthLocked(h *TargetHealth) {
+	b.evaluateLocked()
+	h.Target = b.target
+	h.State = b.state
+	h.FailStreak = b.failStreak
+	h.Probing = b.state == BreakerHalfOpen
+	h.ProbeAllowance = b.cfg.ProbeAllowance
+	h.ProbesUsed = b.probesUsed
+	h.ProbesLive = b.probesLive
+	rem := b.cfg.ProbeAllowance - b.probesUsed
+	if rem < 0 {
+		rem = 0
+	}
+	h.ProbesRemaining = rem
+	h.Successes = b.successes
+	h.Rejects = b.rejects
+	h.SlowFailures = b.slowFailures
+	h.BreakerRejects = b.breakerRejects
+	h.Dispatched = b.dispatched
+	h.CallerCanceled = b.callerCanceled
+	h.BudgetExhausted = b.budgetExhausted
 }
 
 func (b *Breaker) transitionLocked(to BreakerState, why string) {

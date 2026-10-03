@@ -17,7 +17,11 @@ type AttemptRecord struct {
 	Limit       time.Duration // 本次尝试时限（0 表示以剩余预算为限）
 	Result      AttemptResult
 	StateAfter  BreakerState
-	Decision    string // 判定依据（人类可读）
+	// Attribution 是本次尝试的唯一归因结论。它同时决定：
+	// 返回给调用方的最终原因、本轨迹的判定分类、健康视图的计数类别。
+	Attribution Attribution
+	Dispatched  bool // 下游调用是否真的发出（false=放行后未发出即终止）
+	Decision    string
 }
 
 func (r AttemptResult) String() string {
@@ -32,6 +36,8 @@ func (r AttemptResult) String() string {
 		return "TIMEOUT"
 	case AttemptBreakerReject:
 		return "BREAKER_REJECT"
+	case AttemptAborted:
+		return "ABORTED"
 	default:
 		return "UNKNOWN"
 	}
@@ -85,10 +91,14 @@ func (tr Trace) Render() string {
 		if a.IsProbe {
 			probe = " [PROBE]"
 		}
-		fmt.Fprintf(&b, "  attempt#%d target=%s breaker=%s->%s%s remaining=%s limit=%s result=%s | %s\n",
+		dispatched := "dispatched"
+		if !a.Dispatched {
+			dispatched = "NOT_DISPATCHED"
+		}
+		fmt.Fprintf(&b, "  attempt#%d target=%s breaker=%s->%s%s remaining=%s limit=%s result=%s classify=%s %s | %s\n",
 			a.Index, a.Target, a.StateBefore, a.StateAfter, probe,
 			a.Remaining.Round(time.Millisecond), a.Limit.Round(time.Millisecond),
-			a.Result, a.Decision)
+			a.Result, a.Attribution, dispatched, a.Decision)
 	}
 	return b.String()
 }

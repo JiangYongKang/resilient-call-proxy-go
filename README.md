@@ -24,7 +24,8 @@
 | `breaker.go` | 单目标熔断器：连续失败阈值、冷却、半开受控探测、迁移可观测 |
 | `retry.go` | 重试与退避策略（仅幂等、明确拒绝不重试、退避不越预算） |
 | `proxy.go` | 编排：路由 → 熔断 → 下游 → 重试/退避 → 降级，统一归因 |
-| `trace.go` | 每次尝试的剩余预算 / 熔断状态 / 判定依据的轨迹与渲染 |
+| `trace.go` | 每次尝试的剩余预算 / 熔断状态 / 判定依据 / 归因的轨迹与渲染 |
+| `health.go` | 按目标的健康视图：成功/拒绝/慢故障/熔断拦截计数、熔断与探测名额、非目标责任终止 |
 
 ## 一、路由与超时预算规则
 
@@ -111,21 +112,88 @@
 
 ## 四、可观测性
 
+### 4.1 轨迹（每次请求）
+
 `Trace.Render()` 为每次请求输出多行日志，逐次尝试打印：
 
 - 尝试序号与目标；
 - 尝试前后熔断状态、是否半开探测；
 - **尝试开始时的剩余预算**与本次尝试时限；
-- 下游结果与**判定依据**（人类可读，说明为何重试 / 不重试 / 被熔断 / 被预算截断）；
+- 下游结果、**归因分类（classify）**与**是否真正发出（dispatched / NOT_DISPATCHED）**；
+- **判定依据**（人类可读，说明为何重试 / 不重试 / 被熔断 / 被预算截断）；
 - 最终原因、原始原因、是否走了降级。
 
 示例：
 
 ```text
 trace route=pay idempotent=true attempts=2 final=budget_exhausted fallback=false
-  attempt#1 target=pay-0 breaker=CLOSED->CLOSED remaining=100ms limit=100ms result=SLOW_FAIL | slow failure (transient); safe to retry; retry after backoff 1ms
-  attempt#2 target=pay-0 breaker=CLOSED->CLOSED remaining=39ms limit=39ms result=TIMEOUT | downstream call cut off by shared budget; stop immediately without retry: budget_exhausted
+  attempt#1 target=pay-0 breaker=CLOSED->CLOSED remaining=100ms limit=100ms result=SLOW_FAIL classify=slow_failure dispatched | slow failure (transient); safe to retry; retry after backoff 1ms
+  attempt#2 target=pay-0 breaker=CLOSED->CLOSED remaining=39ms limit=39ms result=TIMEOUT classify=budget_exhausted dispatched | call ran to the shared-budget deadline (remaining <= epsilon); attributed to budget_exhausted, not a target failure; breaker unchanged, probe slot returned
 ```
+
+### 4.2 目标健康视图（按目标聚合）
+
+`Proxy.HealthSnapshot()` 返回全部目标在**同一时刻的一致快照**，
+`Proxy.TargetHealthOf(t)` 返回单个目标。快照只读内存、按固定顺序
+（route/index/name）短暂持有各熔断器自己的锁，不在调用热路径上，
+可与正常调用并发且不会拖慢调用。
+
+`TargetHealth` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `State` | 当前熔断状态（CLOSED / OPEN / HALF_OPEN） |
+| `FailStreak` | 当前**连续目标失败**累计（一次成功清零；取消/预算耗尽不累加） |
+| `Probing` | 当前是否正处于 HALF_OPEN 探测窗口 |
+| `ProbeAllowance` | 半开窗口探测名额总量 |
+| `ProbesUsed` | 本窗口已放行（尚未归还为可用）的探测名额数 |
+| `ProbesLive` | 正在途（已放行未归还）的探测数 |
+| `ProbesRemaining` | 还能再放多少个探测 = `ProbeAllowance - ProbesUsed` |
+| `Successes` | 成功次数（下游接受） |
+| `Rejects` | 被下游**明确拒绝**次数 |
+| `SlowFailures` | 慢故障 / 抖动 / 目标侧超时时限次数 |
+| `BreakerRejects` | 被熔断拦下、**根本没发出去**的次数 |
+| `Dispatched` | **实际真正发到下游**的次数（未发出的终止不计入） |
+| `CallerCanceled` | 归到该目标尝试上的**发起方取消**次数（非目标责任） |
+| `BudgetExhausted` | 归到该目标尝试上的**共享预算耗尽**次数（非目标责任） |
+
+另有 `HealthView.OrphanCallerCanceled` / `OrphanBudgetExhausted`：
+无法归到任何具体目标的非目标责任终止（如第一次尝试开始前就取消、
+退避等待期间终止）。
+
+### 4.3 什么算“目标失败”，什么算“非目标责任终止”
+
+**目标失败**（计入 `Rejects`/`SlowFailures`、累加 `FailStreak`、可推动熔断）：
+
+- 下游明确拒绝（`downstream_reject`）；
+- 预算仍充足时下游给出的慢故障 / 抖动 / 目标侧尝试时限超时。
+
+**非目标责任终止**（不计失败、**不推动熔断**，在健康视图单独可见）：
+
+- `caller_canceled`：发起方自己取消；
+- `budget_exhausted`：共享总时间预算耗尽。
+
+关键边界：
+
+- 即使在**冷却结束、正在放探测的半开窗口**里被取消 / 预算耗尽，熔断也
+  **保持 HALF_OPEN，不重新 OPEN**；该探测名额**完整归还**（`ProbesUsed`
+  回退），后续探测仍可被放行。
+- 若某次下游调用**根本没发出去**（放行后、进入下游前预算恰好终止），结果为
+  `ABORTED`：不计 `Dispatched`、不计失败、不占下游并发名额，探测名额归还。
+- 尝试时限被裁到“剩余预算 − ε”，因此慢调用恰好在预算到期前一个时钟精度
+  返回时，仍归为 `budget_exhausted` 而非目标失败（ε 规则保证归因确定可复现）。
+
+### 4.4 三处结论对齐
+
+同一次请求的三处结论必须一致，且共享同一个 `Attribution` 来源：
+
+1. **返回给调用方的最终原因**（`Do` 返回的 `Reason`）；
+2. **轨迹里每次尝试的判定依据**（`AttemptRecord.Attribution`）；
+3. **健康视图里的分类统计**（`TargetHealth` 各计数）。
+
+例如一次半开探测被发起方取消：调用方拿到 `caller_canceled`、轨迹该尝试
+`classify=caller_canceled`、健康视图该目标 `CallerCanceled+1` 且熔断仍为
+HALF_OPEN——不会出现“调用方说是取消、熔断却按失败重开”的矛盾。
 
 ## 五、验证方法
 
@@ -155,6 +223,14 @@ go test ./... -v
 | `TestProxy_ConcurrentRetriesDoNotAmplify` | 并发下总下游调用 ≤ N×MaxAttempts、目标可追溯 |
 | `TestProxy_FallbackFailureIsDistinguishable` | 降级失败可判别且保留原始原因 |
 | `TestRouter_TargetSelectionTraceable` | 每请求基号、请求内顺延、跨请求轮询 |
+| `TestHealthView_TargetSideCounters` | 成功/拒绝/慢故障计数、实际发出次数、轨迹归因 |
+| `TestHealth_HalfOpenProbeCanceledStaysHalfOpen` | 半开探测被取消：状态不变、名额归还、调用数有上界、计数对齐（并发） |
+| `TestHealth_HalfOpenProbeBudgetExhaustedStaysHalfOpen` | 半开探测遇预算耗尽：状态不变、名额归还、不记失败 |
+| `TestHealth_BudgetCutoffInClosedDoesNotAdvanceStreak` | CLOSED 下预算截断不累加连续失败、不推动熔断 |
+| `TestHealth_AbortedBeforeDispatchNotCounted` | 放行后未发出即终止：ABORTED、不计调用/失败、名额归还 |
+| `TestHealthView_ConcurrentSnapshotWithCalls` | 快照与调用并发、字段自洽、-race 无竞争 |
+| `TestHealth_OrphanCancelBeforeAnyAttempt` | 尝试前取消计入孤儿终止、零下游调用、熔断不变 |
+| `TestHealth_ThreeWayAlignment` | 调用方原因 / 轨迹归因 / 健康分类三处一致 |
 
 ## 六、在真实时钟下使用
 
@@ -164,3 +240,35 @@ go test ./... -v
 p := resilient.New(resilient.NewRealClock(), entries, cfg)
 resp, reason, trace := p.Do(&resilient.Request{Route: "pay", Idempotent: true}, nil, 0)
 ```
+
+读取目标健康视图（只读、可与调用并发）：
+
+```go
+view := p.HealthSnapshot() // 全部目标的同一时刻一致快照
+for _, h := range view.Targets {
+    log.Printf("target=%s state=%s streak=%d probing=%t probes=%d/%d "+
+        "ok=%d reject=%d slow=%d breakerReject=%d dispatched=%d "+
+        "canceled=%d budgetEnd=%d",
+        h.Target, h.State, h.FailStreak, h.Probing,
+        h.ProbesUsed, h.ProbeAllowance,
+        h.Successes, h.Rejects, h.SlowFailures, h.BreakerRejects, h.Dispatched,
+        h.CallerCanceled, h.BudgetExhausted)
+}
+if h, ok := p.TargetHealthOf(target); ok { // 单目标
+    _ = h
+}
+```
+
+## 七、兼容范围
+
+- **纯增量扩展**：新增 `health.go`、`AttemptRecord.Attribution/Dispatched`
+  字段、`AttemptAborted` 结果、`Permit.ReleaseAborted` 方法、
+  `Proxy.HealthSnapshot/TargetHealthOf`。既有 `Do` / `DoWithBudget` 签名、
+  `Reason` 取值、`Trace` 既有字段与熔断器状态机迁移规则保持不变。
+- **行为边界收紧（语义更严格，非破坏性）**：发起方取消与共享预算耗尽不再
+  被计为目标失败、不再推动熔断（含半开探测窗口），探测名额改为完整归还。
+  这是对“非目标责任终止”归因的明确化；依赖“超时也会重开熔断”这一副作用的
+  调用方需留意——真实目标失败（预算仍充足时的慢故障/拒绝）仍照常推动熔断。
+- 计数为进程内内存累计，自 `Proxy` 构造起生效，不持久化、不跨进程；
+  健康视图用于监控/排障的现场读数，不承诺跨重启连续。
+- `HealthSnapshot` 返回的是值拷贝，调用方持有后不受后续状态变化影响。

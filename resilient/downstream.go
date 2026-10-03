@@ -29,6 +29,7 @@ const (
 	AttemptSlowFail                           // 慢故障：延迟后失败（模拟抖动，可安全重试）
 	AttemptTimeout                            // 占用直到时限/预算耗尽
 	AttemptBreakerReject                      // 未进入下游：被熔断器快速拒绝（OPEN/HALF_OPEN 名额满）
+	AttemptAborted                            // 已放行但下游调用根本未发出即被取消/预算终止
 )
 
 // ScriptedBehavior 是脚本化的下游行为：按“该目标被调用的序号”返回预设
@@ -73,6 +74,13 @@ func (d *Downstream) script(t Target) *ScriptedBehavior {
 //   - 预算到期/取消时立即返回 AttemptTimeout 并释放占用名额，不继续占资源；
 //   - 返回调用期间该目标观测到的并发占用峰值。
 func (d *Downstream) Call(t Target, b *Budget, attemptLimit time.Duration) (AttemptResult, int) {
+	// 预算在“进入下游之前”已经终止（取消/到期）：这次调用根本不发出——
+	// 不进入脚本（不增加 callCount、不占用并发名额），归为 ABORTED。
+	// 调用方据此做中性归还：不算目标被调用、不计失败、不推动熔断。
+	if err := b.Err(); err != nil {
+		return AttemptAborted, 0
+	}
+
 	s := d.script(t)
 	if s == nil {
 		s = &ScriptedBehavior{Default: AttemptOK}
@@ -80,11 +88,6 @@ func (d *Downstream) Call(t Target, b *Budget, attemptLimit time.Duration) (Atte
 
 	res := s.enter()
 	defer s.leave()
-
-	// 预算在进入时已经终止：直接截断，不占用额外时间。
-	if b.Remaining() <= 0 {
-		return AttemptTimeout, s.peak()
-	}
 
 	switch res {
 	case AttemptReject:

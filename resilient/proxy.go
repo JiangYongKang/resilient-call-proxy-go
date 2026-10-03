@@ -16,6 +16,11 @@ type Proxy struct {
 	mu       sync.RWMutex
 	breakers map[Target]*Breaker
 
+	// 无法归到任何具体目标的非目标责任终止（尝试开始前/退避中终止）。
+	// 健康视图在聚合快照时读取。
+	orphanCanceled  int64
+	orphanBudgetEnd int64
+
 	totalTimeout    time.Duration
 	perAttemptLimit time.Duration
 	epsilon         time.Duration
@@ -86,9 +91,12 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 
 	tr := Trace{Route: req.Route, Idempotent: req.Idempotent}
 
-	// 调用前预算已经终止（例如取消信号先到），直接给出可区分原因。
+	// 调用前预算已经终止（例如取消信号先到）：没有任何目标被尝试，属于
+	// 非目标责任终止（孤儿计数），直接给出可区分原因。
 	if err := budget.Err(); err != nil {
+		attr := p.neutralAttr(err.Reason)
 		tr.FinalReason = err.Reason
+		p.recordOrphan(attr)
 		p.tracer.add(tr)
 		return nil, err.Reason, tr
 	}
@@ -107,7 +115,9 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 	for round := 0; round < maxAttempts; round++ {
 		// 每次尝试前检查共享预算：不得越过剩余预算发起新尝试。
 		if err := budget.Err(); err != nil {
+			attr := p.neutralAttr(err.Reason)
 			tr.FinalReason = err.Reason
+			p.recordOrphan(attr)
 			p.tracer.add(tr)
 			return nil, err.Reason, tr
 		}
@@ -116,6 +126,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 		// 视为预算耗尽，绝不发起新的下游尝试（不放大请求量）。
 		if remaining <= p.epsilon {
 			tr.FinalReason = ReasonBudgetExhausted
+			p.recordOrphan(AttrBudgetExhausted)
 			p.tracer.add(tr)
 			return nil, ReasonBudgetExhausted, tr
 		}
@@ -137,7 +148,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 			Limit:       p.attemptLimit(remaining),
 		}
 		// 先放入轨迹并持有引用：本尝试后续的判定依据会持续写入该记录，
-		// 保证最终轨迹完整反映“剩余预算/熔断状态/判定依据”。
+		// 保证最终轨迹完整反映“剩余预算/熔断状态/判定依据/归因”。
 		tr.Attempts = append(tr.Attempts, ar0)
 		rec := &tr.Attempts[len(tr.Attempts)-1]
 
@@ -147,6 +158,8 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 			rec.Result = AttemptBreakerReject
 			rec.StateAfter = br.State()
 			rec.IsProbe = false
+			rec.Dispatched = false
+			rec.Attribution = AttrBreakerReject
 			rec.Decision = "breaker fast-fail (OPEN or HALF_OPEN probe allowance exhausted); try next target without downstream call"
 			lastRes = AttemptBreakerReject
 			continue
@@ -154,47 +167,100 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 		rec.IsProbe = permit.IsProbe()
 		allTargetsRejected = false
 
-		// 放行后、调用下游前再次确认预算（极端情况下恰在此时到期）。
+		// 放行后、调用下游前再次确认预算（极端情况下恰在此时到期/取消）。
+		// 这次根本不会发往下游：中性归还，不算目标被调用、不计失败、
+		// 不推动熔断；探测名额立即归还，半开窗口不因此重开。
 		if err := budget.Err(); err != nil {
-			permit.Release(AttemptTimeout) // 名额立即归还，探测名额不泄漏
-			rec.Result = AttemptTimeout
+			attr := p.neutralAttr(err.Reason)
+			permit.ReleaseAborted(false, err.Reason)
+			rec.Result = AttemptAborted
 			rec.StateAfter = br.State()
-			rec.Decision = "budget terminated before downstream call; release permit immediately"
+			rec.Dispatched = false
+			rec.Attribution = attr
+			rec.Decision = "budget terminated after permit but before dispatch; not counted as a target call, permit released without touching breaker: " + attr.String()
 			tr.FinalReason = err.Reason
 			p.tracer.add(tr)
 			return nil, err.Reason, tr
 		}
 
 		res, _ := p.down.Call(target, budget, rec.Limit)
-		permit.Release(res) // 严格归还：成功、失败、超时都不继续占用名额
 		rec.Result = res
 		rec.StateAfter = br.State()
-		lastRes = res
 
-		if res == AttemptOK {
-			rec.Decision = "downstream accepted; return success, no further attempts"
-			tr.FinalReason = ReasonUnknown
+		// 下游进入前被预算终止（与上面对齐的极小竞争窗口）：同样按“未发出”
+		// 的中性终止处理，三处结论保持一致。
+		if res == AttemptAborted {
+			err := budget.Err()
+			reason := ReasonBudgetExhausted
+			if err != nil {
+				reason = err.Reason
+			}
+			attr := p.neutralAttr(reason)
+			permit.ReleaseAborted(false, reason)
+			rec.StateAfter = br.State()
+			rec.Dispatched = false
+			rec.Attribution = attr
+			rec.Decision = "downstream not entered because budget terminated; target is not charged, probe slot returned: " + attr.String()
+			tr.FinalReason = reason
 			p.tracer.add(tr)
-			return &Response{Target: target.String(), OK: true, Body: "ok"}, ReasonUnknown, tr
+			return nil, reason, tr
 		}
-		// 失败归因与是否还能继续。
-		// 1) 预算在调用期间终止：超时/取消具有最高优先级，原因可区分。
+
+		rec.Dispatched = true
+
+		// 调用期间预算终止（取消/到期）：优先级最高。即便下游已在途，
+		// 这也不是目标侧失败——中性归还，不推动熔断；半开探测被取消时
+		// 不重开熔断、名额归还。
 		if err := budget.Err(); err != nil {
-			rec.Decision = "downstream call cut off by shared budget; stop immediately without retry: " + err.Reason.String()
+			attr := p.neutralAttr(err.Reason)
+			permit.ReleaseAborted(true, err.Reason)
+			rec.StateAfter = br.State()
+			rec.Attribution = attr
+			rec.Decision = "in-flight call cut off by shared budget (" + attr.String() + "); neutral to target: no failure counted, breaker unchanged, probe slot returned"
 			tr.FinalReason = err.Reason
 			p.tracer.add(tr)
 			return nil, err.Reason, tr
 		}
 
-		// 2) 下游明确拒绝：确定结论，不重试，直接走失败/降级。
+		// 调用恰好顶到预算终点（尝试时限被裁到 剩余预算-ε，慢调用在预算到期
+		// 前一个时钟精度“自然醒来”）：预算尚未被标记终止，但剩余已不足一个
+		// 时钟精度。这种调用在语义上就是“被共享预算耗尽截断”，不是下游给出
+		// 的独立失败裁决——归为中性预算耗尽，不计目标失败、不推动熔断。
+		// 成功结果不受影响：下游既然接受了，就是目标侧成功。
+		if res != AttemptOK && budget.Remaining() <= p.epsilon {
+			permit.ReleaseAborted(true, ReasonBudgetExhausted)
+			rec.StateAfter = br.State()
+			rec.Attribution = AttrBudgetExhausted
+			rec.Decision = "call ran to the shared-budget deadline (remaining <= epsilon); attributed to budget_exhausted, not a target failure; breaker unchanged, probe slot returned"
+			tr.FinalReason = ReasonBudgetExhausted
+			p.tracer.add(tr)
+			return nil, ReasonBudgetExhausted, tr
+		}
+
+		// 走到这里说明预算存活，下游给出了真正的目标侧裁决：携裁决归还，
+		// 计数与熔断迁移都以本次结果为准。
+		permit.Release(res)
+		rec.StateAfter = br.State()
+
+		if res == AttemptOK {
+			rec.Attribution = AttrSuccess
+			rec.Decision = "downstream accepted; return success, no further attempts"
+			tr.FinalReason = ReasonUnknown
+			p.tracer.add(tr)
+			return &Response{Target: target.String(), OK: true, Body: "ok"}, ReasonUnknown, tr
+		}
+
+		// 下游明确拒绝：确定的目标侧结论，不重试，直接走失败/降级。
 		if res == AttemptReject {
-			rec.Decision = "downstream explicitly rejected; rejection is definitive, never retry"
+			rec.Attribution = AttrDownstreamReject
+			rec.Decision = "downstream explicitly rejected; rejection is a definitive target verdict, never retried"
 			tr.Cause = ReasonDownstreamReject
 			tr.FinalReason = ReasonDownstreamReject
 			return p.finishWithFallback(req, tr)
 		}
 
-		// 3) 慢故障（抖动）：
+		// 慢故障/抖动（含目标自己的尝试时限先到 AttemptTimeout）：目标侧失败。
+		rec.Attribution = AttrSlowFailure
 		//    - 非幂等请求不得重试；
 		//    - 探测请求不得再触发额外尝试（避免半开放大流量）；
 		//    - 已达总尝试上限：停止。
@@ -202,7 +268,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 		switch {
 		case permit.IsProbe():
 			canRetry = false
-			rec.Decision = "half-open probe failed; probe does not trigger additional attempts"
+			rec.Decision = "half-open probe target failure; probe does not trigger additional attempts"
 		case !req.Idempotent:
 			rec.Decision = "slow failure on non-idempotent request; retry forbidden"
 		default:
@@ -219,7 +285,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 			return p.finishWithFallback(req, tr)
 		}
 
-		// 4) 退避后重试；退避受共享预算约束。若退避会恰好睡到预算终点，
+		// 退避后重试；退避受共享预算约束。若退避会恰好睡到预算终点，
 		// 提前一个时钟精度结束，使预算到期稳定先触发（归因确定可复现）。
 		bo := p.retry.Backoff(round+1, budget.Remaining())
 		if bo > 0 && bo >= budget.Remaining() && bo > p.epsilon {
@@ -229,8 +295,11 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 		if bo > 0 {
 			if !p.clock.Sleep(budget, bo) {
 				err := budget.Err()
-				rec.Decision += "; budget terminated during backoff: " + err.Reason.String()
+				attr := p.neutralAttr(err.Reason)
+				rec.StateAfter = br.State()
+				rec.Decision += "; budget terminated during backoff (no target charged): " + attr.String()
 				tr.FinalReason = err.Reason
+				p.recordOrphan(attr)
 				p.tracer.add(tr)
 				return nil, err.Reason, tr
 			}
@@ -243,6 +312,25 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 		tr.FinalReason = ReasonAllAttemptsFailed
 	}
 	return p.finishWithFallback(req, tr)
+}
+
+// neutralAttr 把预算终止原因映射为非目标责任归因；非法输入保守归为预算耗尽。
+func (p *Proxy) neutralAttr(r Reason) Attribution {
+	if r == ReasonCallerCanceled {
+		return AttrCallerCanceled
+	}
+	return AttrBudgetExhausted
+}
+
+// recordOrphan 累计无法归到具体目标的非目标责任终止（健康视图单独可见）。
+func (p *Proxy) recordOrphan(a Attribution) {
+	p.mu.Lock()
+	if a == AttrCallerCanceled {
+		p.orphanCanceled++
+	} else {
+		p.orphanBudgetEnd++
+	}
+	p.mu.Unlock()
 }
 
 // BreakerOf 返回某目标的熔断器（观测用）。
