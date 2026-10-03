@@ -60,6 +60,14 @@ type Breaker struct {
 	probesUsed  int
 	probesLive  int
 	transitions []Transition
+
+	// 健康视图计数：与状态机同锁更新，Snapshot 读出即一致快照。
+	successes      uint64 // 下游实际接受
+	rejects        uint64 // 下游明确拒绝
+	slowFails      uint64 // 慢故障/抖动（含目标自身超时）
+	breakerRejects uint64 // 熔断快速拒绝（未发往下游）
+	abortCaller    uint64 // 发起方取消截断（非目标责任）
+	abortBudget    uint64 // 共享预算耗尽截断（非目标责任）
 }
 
 func NewBreaker(t Target, cfg BreakerConfig, clock Clock) *Breaker {
@@ -83,13 +91,31 @@ type Permit struct {
 // IsProbe 报告本次放行是否为 HALF_OPEN 探测请求。
 func (p *Permit) IsProbe() bool { return p != nil && p.probe }
 
-// Release 归还名额并按调用结果驱动状态迁移。
+// Release 归还名额并按“目标责任”的调用结果驱动状态迁移与计数。
+// 仅当下游给出了可归因于目标的裁决（成功/拒绝/慢故障/自身超时）时使用；
+// 发起方取消或共享预算耗尽截断的尝试必须用 Abandon 归还。
 func (p *Permit) Release(result AttemptResult) {
 	if p == nil || p.used {
 		return
 	}
 	p.used = true
 	p.br.record(p.probe, result)
+}
+
+// Abandon 以“非目标责任”的原因归还名额：本次尝试被发起方取消或共享
+// 预算耗尽截断，结果不含任何关于目标健康的信息。因此：
+//   - 名额（含半开探测名额）如数归还，探测额度退回，可再放行新探测；
+//   - 不计入目标失败、不改变连续失败计数、不驱动任何状态迁移——
+//     即使在 HALF_OPEN 探测窗口内被取消，也不会因此重新 OPEN；
+//   - 仅在健康视图中记入对应的非目标责任终止计数，单独可见。
+//
+// r 只取 ReasonCallerCanceled / ReasonBudgetExhausted 两种终止原因。
+func (p *Permit) Abandon(r Reason) {
+	if p == nil || p.used {
+		return
+	}
+	p.used = true
+	p.br.abandon(p.probe, r)
 }
 
 // State 返回当前状态；惰性评估冷却到期（OPEN -> HALF_OPEN）。
@@ -116,8 +142,10 @@ func (b *Breaker) Allow() (*Permit, bool) {
 			b.probesLive++
 			return &Permit{br: b, probe: true}, true
 		}
+		b.breakerRejects++
 		return nil, false
 	default: // OPEN
+		b.breakerRejects++
 		return nil, false
 	}
 }
@@ -143,12 +171,23 @@ func (b *Breaker) evaluateLocked() {
 	}
 }
 
-// record 根据一次已放行调用的结果更新状态。
+// record 根据一次已放行调用的“目标责任”结果更新状态与健康计数。
 func (b *Breaker) record(probe bool, result AttemptResult) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	ok := result == AttemptOK
+
+	// 健康计数：无论状态机是否还会消费该结果（如迟到的探测归还），
+	// 目标确实给出了这个裁决，都如实归类。
+	switch result {
+	case AttemptOK:
+		b.successes++
+	case AttemptReject:
+		b.rejects++
+	case AttemptSlowFail, AttemptTimeout:
+		b.slowFails++
+	}
 
 	if probe {
 		// 探测名额归还：无论成功失败，占用名额都要释放。
@@ -188,6 +227,29 @@ func (b *Breaker) record(probe bool, result AttemptResult) {
 			b.transitionLocked(BreakerOpen, "non-probe failure in half-open; reopen")
 			b.openedAt = b.clock.Now()
 		}
+	}
+}
+
+// abandon 归还一次“非目标责任”终止的名额：只退名额、只记终止计数，
+// 不触碰 failStreak，不驱动任何状态迁移。
+func (b *Breaker) abandon(probe bool, r Reason) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if probe {
+		// 探测名额归还：本次探测未获得任何目标健康信息，
+		// 占用额度退回，允许后续请求重新探测（熔断器不会因此卡死在半开）。
+		if b.probesLive > 0 {
+			b.probesLive--
+		}
+		if b.probesUsed > 0 {
+			b.probesUsed--
+		}
+	}
+	if r == ReasonCallerCanceled {
+		b.abortCaller++
+	} else {
+		b.abortBudget++
 	}
 }
 

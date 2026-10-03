@@ -32,6 +32,8 @@ func (r AttemptResult) String() string {
 		return "TIMEOUT"
 	case AttemptBreakerReject:
 		return "BREAKER_REJECT"
+	case AttemptAborted:
+		return "ABORTED"
 	default:
 		return "UNKNOWN"
 	}

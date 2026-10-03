@@ -29,6 +29,7 @@ const (
 	AttemptSlowFail                           // 慢故障：延迟后失败（模拟抖动，可安全重试）
 	AttemptTimeout                            // 占用直到时限/预算耗尽
 	AttemptBreakerReject                      // 未进入下游：被熔断器快速拒绝（OPEN/HALF_OPEN 名额满）
+	AttemptAborted                            // 非目标责任终止：发起方取消/共享预算耗尽截断（下游脚本不会返回，仅用于轨迹记录）
 )
 
 // ScriptedBehavior 是脚本化的下游行为：按“该目标被调用的序号”返回预设

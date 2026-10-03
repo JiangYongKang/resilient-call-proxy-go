@@ -7,7 +7,8 @@
 - 请求路由与**共享超时预算**在多次尝试 / 多次下游调用间的传播；
 - 熔断器的 CLOSED → OPEN → HALF_OPEN → CLOSED 状态迁移；
 - 仅对幂等请求的安全重试、退避与请求量不放大；
-- 每种失败的**可区分原因**与完整判定轨迹（trace）。
+- 每种失败的**可区分原因**与完整判定轨迹（trace）；
+- 按目标的**健康视图**：一致快照、失败/拦截/非目标责任终止分类计数。
 
 > 全部时间逻辑由确定性假时钟 `FakeClock` 驱动，单测零墙钟等待、零网络，
 > 可通过 `go test -race -count=N` 重复稳定验证。
@@ -25,6 +26,7 @@
 | `retry.go` | 重试与退避策略（仅幂等、明确拒绝不重试、退避不越预算） |
 | `proxy.go` | 编排：路由 → 熔断 → 下游 → 重试/退避 → 降级，统一归因 |
 | `trace.go` | 每次尝试的剩余预算 / 熔断状态 / 判定依据的轨迹与渲染 |
+| `health.go` | 按目标的健康视图：一致快照、归类计数、非目标责任终止单列 |
 
 ## 一、路由与超时预算规则
 
@@ -124,10 +126,79 @@
 ```text
 trace route=pay idempotent=true attempts=2 final=budget_exhausted fallback=false
   attempt#1 target=pay-0 breaker=CLOSED->CLOSED remaining=100ms limit=100ms result=SLOW_FAIL | slow failure (transient); safe to retry; retry after backoff 1ms
-  attempt#2 target=pay-0 breaker=CLOSED->CLOSED remaining=39ms limit=39ms result=TIMEOUT | downstream call cut off by shared budget; stop immediately without retry: budget_exhausted
+  attempt#2 target=pay-0 breaker=CLOSED->CLOSED remaining=39ms limit=39ms result=SLOW_FAIL | slow failure (transient); safe to retry; retry after backoff 100µs
+
+trace route=pay idempotent=true attempts=1 final=caller_canceled fallback=false
+  attempt#1 target=pay-0 breaker=HALF_OPEN->HALF_OPEN [PROBE] remaining=100ms limit=100ms result=ABORTED | downstream call cut off by shared budget; classified as non-target termination (permit abandoned, breaker untouched): caller_canceled
 ```
 
-## 五、验证方法
+第二条展示了归因边界：半开探测被发起方取消，尝试结果为 `ABORTED`，
+熔断状态保持 `HALF_OPEN->HALF_OPEN`，健康视图记入 `AbortedByCaller`
+而非目标失败。
+
+## 五、目标健康视图与归因边界
+
+### 健康视图
+
+`Proxy.Health(target)` 返回单个目标的一致快照，`Proxy.HealthAll()` 返回
+全部已知目标（按目标名排序，输出确定）。快照字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `State` | 当前熔断状态（CLOSED / OPEN / HALF_OPEN，含冷却到期的惰性评估） |
+| `FailStreak` | 连续失败累计（CLOSED 下有效；一次成功即清零） |
+| `Probing` | 是否正在放探测（HALF_OPEN 且有在途探测） |
+| `ProbesUsed` / `ProbesLive` / `ProbeAllowance` | 本半开窗口已放行探测数 / 在途探测数 / 名额上限 |
+| `Successes` | 下游实际接受的次数 |
+| `Rejects` | 下游明确拒绝的次数 |
+| `SlowFailures` | 慢故障/抖动次数（含目标自身超时） |
+| `BreakerRejects` | 被熔断快速拒绝、根本未发往下游的次数 |
+| `AbortedByCaller` | 被发起方取消截断的尝试次数（非目标责任） |
+| `AbortedByBudget` | 被共享预算耗尽截断的尝试次数（非目标责任） |
+
+- **一致性**：每个目标的全部字段在熔断器同一把锁内一次读出，
+  一组数字必然是同一时刻的一致快照，不会自相矛盾。
+- **不拖慢调用路径**：计数更新复用熔断器已有的临界区，查询只读，
+  调用热路径不新增任何锁；健康查询可与正常调用并发执行。
+- **三处对齐**：同一次请求“返回给调用方的最终原因、轨迹里每次尝试的
+  判定依据、健康视图的分类计数”由同一处归因逻辑产出，结论必然一致
+  （单测用轨迹重放与健康视图逐字段对账）。
+
+### 归因边界：什么算目标失败，什么不算
+
+计入目标失败（`SlowFailures`/`Rejects`，并推动连续失败计数与熔断状态机）：
+
+- 下游明确拒绝（`Rejects`，确定结论，不重试）；
+- 慢故障/抖动、目标自身超时（`SlowFailures`）。
+
+**不**计入目标失败、也**不**推动熔断状态变化（`AbortedByCaller`/`AbortedByBudget`
+单独计数）：
+
+- 发起方主动取消截断了该目标的尝试；
+- 共享总预算耗尽截断了该目标的尝试。
+
+这类终止不含任何关于目标健康的信息，因此名额（含半开探测名额）中立归还：
+即使在冷却结束、正在放探测的窗口里被取消/超时，熔断器也**不会**因此重新
+打开，探测名额如数退回（后续请求可再次探测，熔断器不会卡死在半开）。
+若某次尝试在放行后、尚未发往下游前就被预算终止，则该次不算目标被调用过，
+也不计失败（下游实际调用次数以 `Downstream.Calls` 为准，轨迹
+`Decision` 会注明 "before downstream call"）。
+
+被熔断快速拒绝的尝试（`BreakerRejects`）同样未触达下游，单独计数，
+不算目标被调用过，也不计入目标失败。
+
+### 兼容范围
+
+- 本次变更为**纯新增 API**：`HealthSnapshot`、`Proxy.Health`、
+  `Proxy.HealthAll`、`Breaker.Snapshot`、`Permit.Abandon`、
+  `AttemptAborted`（仅用于轨迹记录，下游脚本不会返回）。
+- `Permit.Release` 对“目标责任结果”的语义不变；既有配置项、路由、
+  重试、降级行为不变。
+- 行为变化仅一处（即本次要理清的归因边界）：被发起方取消 / 共享预算
+  耗尽截断的尝试，不再计入目标失败、不再推动熔断状态迁移（此前会被
+  记为一次失败并可能在半开窗口误触发重新打开）。
+
+## 六、验证方法
 
 ```bash
 # 常规
@@ -155,8 +226,13 @@ go test ./... -v
 | `TestProxy_ConcurrentRetriesDoNotAmplify` | 并发下总下游调用 ≤ N×MaxAttempts、目标可追溯 |
 | `TestProxy_FallbackFailureIsDistinguishable` | 降级失败可判别且保留原始原因 |
 | `TestRouter_TargetSelectionTraceable` | 每请求基号、请求内顺延、跨请求轮询 |
+| `TestBreaker_AbandonIsNeutralAndReturnsProbeSlot` | 取消/预算截断中立归还：不计失败、不迁移状态、探测名额退回 |
+| `TestProxy_HalfOpenProbeCallerCancelKeepsBreaker` | 半开探测被取消：熔断不重开、名额归还、健康视图单独归类 |
+| `TestProxy_BudgetExhaustionAddsNoPhantomFailure` | 预算耗尽不产生幻影失败计数，轨迹/原因/健康三处对齐 |
+| `TestProxy_BudgetExhaustedBeforeHalfOpenProbe` | 预算在探测放行前耗尽：目标未被调用、不计数、状态不变 |
+| `TestProxy_ConcurrentHalfOpenProbeCancel` | 并发压半开窗口取消：在途探测 ≤ 名额、名额不泄漏、健康对账一致 |
 
-## 六、在真实时钟下使用
+## 七、在真实时钟下使用
 
 测试用 `FakeClock`；生产/手工验证可换 `NewRealClock()`，API 完全一致：
 

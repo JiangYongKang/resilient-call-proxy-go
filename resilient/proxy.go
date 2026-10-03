@@ -156,17 +156,33 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 
 		// 放行后、调用下游前再次确认预算（极端情况下恰在此时到期）。
 		if err := budget.Err(); err != nil {
-			permit.Release(AttemptTimeout) // 名额立即归还，探测名额不泄漏
-			rec.Result = AttemptTimeout
+			// 非目标责任终止：名额中立归还（探测额度退回、不推动状态迁移），
+			// 本次未发往下游，不算目标被调用过，也不计目标失败。
+			permit.Abandon(err.Reason)
+			rec.Result = AttemptAborted
 			rec.StateAfter = br.State()
-			rec.Decision = "budget terminated before downstream call; release permit immediately"
+			rec.Decision = "budget terminated before downstream call; permit abandoned neutrally (not a target failure, no downstream call made)"
 			tr.FinalReason = err.Reason
 			p.tracer.add(tr)
 			return nil, err.Reason, tr
 		}
 
 		res, _ := p.down.Call(target, budget, rec.Limit)
-		permit.Release(res) // 严格归还：成功、失败、超时都不继续占用名额
+
+		// 归因边界：预算在调用期间终止（到期/取消）时，下游返回的 TIMEOUT
+		// 不含目标健康信息——名额中立归还，不计目标失败、不推动熔断迁移，
+		// 即使在半开探测窗口内也不因此重新 OPEN。
+		if err := budget.Err(); err != nil {
+			permit.Abandon(err.Reason)
+			rec.Result = AttemptAborted
+			rec.StateAfter = br.State()
+			rec.Decision = "downstream call cut off by shared budget; classified as non-target termination (permit abandoned, breaker untouched): " + err.Reason.String()
+			tr.FinalReason = err.Reason
+			p.tracer.add(tr)
+			return nil, err.Reason, tr
+		}
+
+		permit.Release(res) // 目标责任结果：严格归还，成功、失败、超时都不继续占用名额
 		rec.Result = res
 		rec.StateAfter = br.State()
 		lastRes = res
@@ -178,15 +194,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 			return &Response{Target: target.String(), OK: true, Body: "ok"}, ReasonUnknown, tr
 		}
 		// 失败归因与是否还能继续。
-		// 1) 预算在调用期间终止：超时/取消具有最高优先级，原因可区分。
-		if err := budget.Err(); err != nil {
-			rec.Decision = "downstream call cut off by shared budget; stop immediately without retry: " + err.Reason.String()
-			tr.FinalReason = err.Reason
-			p.tracer.add(tr)
-			return nil, err.Reason, tr
-		}
-
-		// 2) 下游明确拒绝：确定结论，不重试，直接走失败/降级。
+		// 1) 下游明确拒绝：确定结论，不重试，直接走失败/降级。
 		if res == AttemptReject {
 			rec.Decision = "downstream explicitly rejected; rejection is definitive, never retry"
 			tr.Cause = ReasonDownstreamReject
@@ -194,7 +202,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 			return p.finishWithFallback(req, tr)
 		}
 
-		// 3) 慢故障（抖动）：
+		// 2) 慢故障（抖动）：
 		//    - 非幂等请求不得重试；
 		//    - 探测请求不得再触发额外尝试（避免半开放大流量）；
 		//    - 已达总尝试上限：停止。
@@ -219,7 +227,7 @@ func (p *Proxy) DoWithBudget(req *Request, budget *Budget) (*Response, Reason, T
 			return p.finishWithFallback(req, tr)
 		}
 
-		// 4) 退避后重试；退避受共享预算约束。若退避会恰好睡到预算终点，
+		// 3) 退避后重试；退避受共享预算约束。若退避会恰好睡到预算终点，
 		// 提前一个时钟精度结束，使预算到期稳定先触发（归因确定可复现）。
 		bo := p.retry.Backoff(round+1, budget.Remaining())
 		if bo > 0 && bo >= budget.Remaining() && bo > p.epsilon {
